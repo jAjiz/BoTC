@@ -3,7 +3,7 @@ import time
 import logging
 import asyncio
 import json
-from queue import Queue, Full
+from queue import Queue, Full, Empty
 from concurrent.futures import ThreadPoolExecutor
 
 from telegram import Update
@@ -255,15 +255,16 @@ class TelegramInterface:
             try:
                 # Use blocking get with timeout for better responsiveness
                 try:
+                    # Use lambda to pass keyword arguments properly
                     message = await asyncio.get_running_loop().run_in_executor(
-                        self._executor, self._message_queue.get, True, 0.1
+                        self._executor, lambda: self._message_queue.get(block=True, timeout=0.1)
                     )
                     try:
                         await self.app.bot.send_message(chat_id=self.user_id, text=message)
                     except Exception as e:
                         logging.error(f"Failed to send queued message: {e}")
-                except TimeoutError:
-                    # Timeout - queue is empty, continue loop
+                except Empty:
+                    # Queue is empty after timeout, continue loop
                     pass
             except Exception as e:
                 logging.error(f"Error processing message queue: {e}")
