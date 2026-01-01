@@ -1,10 +1,35 @@
-import threading, time, logging, asyncio, json, requests
+import threading
+import time
+import logging
+import asyncio
+import json
+from queue import Queue
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+
 from exchange.kraken import get_last_price, get_current_atr, get_balance
 from core.config import TELEGRAM_TOKEN, ALLOWED_USER_ID, POLL_INTERVAL_SEC, MODE, PAIRS
 
-BOT_PAUSED = False
+# Thread-safe state management
+_state_lock = threading.Lock()
+_bot_paused = False
+
+def get_bot_paused():
+    """Thread-safe getter for bot pause state."""
+    with _state_lock:
+        return _bot_paused
+
+def set_bot_paused(value):
+    """Thread-safe setter for bot pause state."""
+    global _bot_paused
+    with _state_lock:
+        _bot_paused = value
+
+# Backward compatibility
+BOT_PAUSED = property(lambda: get_bot_paused())
 
 # Only log warnings and above from telegram library
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -13,14 +38,42 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.bot").setLevel(logging.WARNING)
 
+
+def run_in_executor(func):
+    """
+    Decorator to run blocking functions in an executor from async context.
+    This prevents blocking the event loop when calling synchronous Kraken API functions.
+    """
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+    return wrapper
+
 class TelegramInterface:
+    """
+    Telegram bot interface for BoTCoin.
+    
+    This class manages the Telegram bot in a separate thread with its own event loop.
+    The architecture uses:
+    - A dedicated thread for the async Telegram bot (required by python-telegram-bot)
+    - A thread-safe queue for sending notifications from the main (sync) thread
+    - ThreadPoolExecutor for running blocking operations from async handlers
+    
+    The separation ensures the synchronous main trading loop is not affected by
+    the asynchronous nature of the Telegram API.
+    """
+    
     def __init__(self, token, user_id):
         self.token = token
         self.user_id = user_id
         self.app = ApplicationBuilder().token(token).build()
-        self._loop = None
+        self._message_queue = Queue()
+        self._running = False
+        self._executor = ThreadPoolExecutor(max_workers=3)
     
     def _check_auth(self, update: Update) -> bool:
+        """Verify that the command comes from the authorized user."""
         return update.effective_user.id == self.user_id
     
     async def send_startup_message(self):
@@ -49,7 +102,7 @@ class TelegramInterface:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update): return
-        status = "⏸ PAUSED" if BOT_PAUSED else "▶️ RUNNING"
+        status = "⏸ PAUSED" if get_bot_paused() else "▶️ RUNNING"
         pairs_list = ', '.join(PAIRS.keys())
         await update.message.reply_text(
             f"Status: {status}\n"
@@ -60,23 +113,25 @@ class TelegramInterface:
 
     async def pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update): return
-        global BOT_PAUSED
-        if BOT_PAUSED:
+        if get_bot_paused():
             await update.message.reply_text("⚠️ Bot is already paused.")
             return
-        BOT_PAUSED = True
+        set_bot_paused(True)
         await update.message.reply_text("⏸ BoTC paused. New operations will not be processed.")
 
     async def resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update): return
-        global BOT_PAUSED
-        if not BOT_PAUSED:
+        if not get_bot_paused():
             await update.message.reply_text("⚠️ Bot is already running.")
             return
-        BOT_PAUSED = False
+        set_bot_paused(False)
         await update.message.reply_text("▶️ BoTC resumed.")
 
     async def market_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Display current market status.
+        Uses executor to run blocking Kraken API calls without blocking the event loop.
+        """
         if not self._check_auth(update): return
         try:
             # Check if a specific pair was requested
@@ -85,15 +140,24 @@ class TelegramInterface:
                 await update.message.reply_text(f"❌ Unknown pair: {pair_filter}\nAvailable: {', '.join(PAIRS.keys())}")
                 return
             
-            balance = get_balance()
+            # Run blocking call in executor
+            loop = asyncio.get_event_loop()
+            balance = await loop.run_in_executor(self._executor, get_balance)
+            
             pairs_to_show = [pair_filter] if pair_filter else list(PAIRS.keys())
             
             msg = "📈 Market Status:\n\n"
             
             for pair in pairs_to_show:
                 try:
-                    price = get_last_price(PAIRS[pair]['primary'])
-                    atr = get_current_atr(pair)
+                    # Run blocking calls in executor to avoid blocking event loop
+                    price = await loop.run_in_executor(
+                        self._executor, get_last_price, PAIRS[pair]['primary']
+                    )
+                    atr = await loop.run_in_executor(
+                        self._executor, get_current_atr, pair
+                    )
+                    
                     asset = PAIRS[pair]['base']
                     asset_balance = float(balance.get(asset, 0))
                     asset_value_eur = asset_balance * price
@@ -118,6 +182,10 @@ class TelegramInterface:
             await update.message.reply_text(f"❌ Error fetching market status: {e}")
 
     async def positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Display open positions.
+        Uses executor for file I/O and blocking API calls.
+        """
         if not self._check_auth(update): return
         try:
             # Check if a specific pair was requested
@@ -126,8 +194,18 @@ class TelegramInterface:
                 await update.message.reply_text(f"❌ Unknown pair: {pair_filter}\nAvailable: {', '.join(PAIRS.keys())}")
                 return
             
-            with open("data/trailing_state.json", "r", encoding="utf-8") as f:
-                all_positions = json.load(f)
+            # Read positions file in executor (I/O operation)
+            loop = asyncio.get_event_loop()
+            
+            def read_positions():
+                with open("data/trailing_state.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+            
+            try:
+                all_positions = await loop.run_in_executor(self._executor, read_positions)
+            except FileNotFoundError:
+                await update.message.reply_text("ℹ️ No positions file found.")
+                return
             
             pairs_to_show = [pair_filter] if pair_filter else list(PAIRS.keys())
             msg = "📊 Open Positions:\n\n"
@@ -139,7 +217,10 @@ class TelegramInterface:
                     continue
                 
                 try:
-                    current_price = get_last_price(PAIRS[pair]['primary'])
+                    # Run blocking API call in executor
+                    current_price = await loop.run_in_executor(
+                        self._executor, get_last_price, PAIRS[pair]['primary']
+                    )
                     msg += f"━━━ {pair} (Price: {current_price:,.2f}€) ━━━\n"
                     
                     for pos_id, pos in pair_positions.items():
@@ -196,35 +277,62 @@ class TelegramInterface:
                 await update.message.reply_text("ℹ️ No open positions.")
             else:
                 await update.message.reply_text(msg[-4000:])
-        except FileNotFoundError:
-            await update.message.reply_text("ℹ️ No positions file found.")
         except Exception as e:
             logging.error(f"Error in positions_command: {e}")
             await update.message.reply_text(f"❌ Error fetching positions: {e}")
 
+    async def _process_message_queue(self):
+        """
+        Background task to process messages from the queue.
+        This allows the main thread to send messages without dealing with async/await.
+        """
+        while self._running:
+            try:
+                # Check queue with timeout to allow checking _running flag
+                if not self._message_queue.empty():
+                    message = self._message_queue.get_nowait()
+                    try:
+                        await self.app.bot.send_message(chat_id=self.user_id, text=message)
+                    except Exception as e:
+                        logging.error(f"Failed to send queued message: {e}")
+                else:
+                    # Small sleep to avoid busy waiting
+                    await asyncio.sleep(0.1)
+            except Exception as e:
+                logging.error(f"Error processing message queue: {e}")
+                await asyncio.sleep(1)
+    
     async def send_message_async(self, message):
+        """Send a message directly (for internal use within async context)."""
         try:
             await self.app.bot.send_message(chat_id=self.user_id, text=message)
         except Exception as e:
             logging.error(f"Telegram async send error: {e}")
 
     def send_message(self, message):
+        """
+        Thread-safe method to send messages from the main (synchronous) thread.
+        Messages are queued and sent by the background task in the Telegram thread.
+        """
         try:
-            if self._loop and self._loop.is_running():
-                asyncio.run_coroutine_threadsafe(self.send_message_async(message), self._loop)
-            else:                
-                url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                requests.post(url, json={"chat_id": self.user_id, "text": message}, timeout=10)
+            self._message_queue.put(message)
         except Exception as e:
-            logging.error(f"Telegram send error: {e}")
+            logging.error(f"Failed to queue message: {e}")
 
     def run(self):
-        # New event loop for this secondary thread
+        """
+        Run the Telegram bot in a dedicated thread.
+        
+        This method creates a new event loop for the thread and lets python-telegram-bot
+        manage it. The event loop is properly cleaned up on exit.
+        """
+        # Create a new event loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        self._loop = loop
+        self._running = True
         
         try:
+            # Register command handlers
             self.app.add_handler(CommandHandler("help", self.help_command))
             self.app.add_handler(CommandHandler("status", self.status_command))
             self.app.add_handler(CommandHandler("pause", self.pause_command))
@@ -232,22 +340,53 @@ class TelegramInterface:
             self.app.add_handler(CommandHandler("market", self.market_command))
             self.app.add_handler(CommandHandler("positions", self.positions_command))
 
+            # Send startup message
             loop.run_until_complete(self.send_startup_message())
-
-            self.app.run_polling(
-                poll_interval=POLL_INTERVAL_SEC, 
-                stop_signals=None, 
-                close_loop=False
-            )
+            
+            # Create background task for processing message queue
+            async def run_bot():
+                # Start message queue processor as background task
+                queue_task = asyncio.create_task(self._process_message_queue())
+                
+                # Run polling (this blocks until stopped)
+                await self.app.initialize()
+                await self.app.start()
+                await self.app.updater.start_polling(poll_interval=POLL_INTERVAL_SEC)
+                
+                # Wait for stop signal (polling will run indefinitely)
+                try:
+                    while self._running:
+                        await asyncio.sleep(1)
+                finally:
+                    # Stop polling and clean up
+                    await self.app.updater.stop()
+                    await self.app.stop()
+                    await self.app.shutdown()
+                    queue_task.cancel()
+                    try:
+                        await queue_task
+                    except asyncio.CancelledError:
+                        pass
+            
+            loop.run_until_complete(run_bot())
+            
         except Exception as e:
             logging.error(f"Telegram thread error: {e}")
         finally:
+            self._running = False
+            # Cleanup executor
+            self._executor.shutdown(wait=False)
+            # Close event loop
             try:
-                if loop.is_running():
-                    loop.close()
-            except:
-                pass
-            self._loop = None
+                # Cancel all remaining tasks
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+            except Exception as e:
+                logging.warning(f"Error closing event loop: {e}")
             logging.info("Telegram thread has exited.")
 
 tg_interface = None
@@ -265,16 +404,19 @@ def send_notification(msg):
     tg_interface.send_message(msg)
 
 def stop_telegram_thread():
+    """
+    Stop the Telegram bot thread gracefully.
+    This sets the running flag to False, which will cause the bot to stop.
+    """
+    global tg_interface
     try:
-        if tg_interface and tg_interface.app and tg_interface._loop and tg_interface._loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(tg_interface.app.stop(), tg_interface._loop)
-            try:
-                future.result(timeout=5) # Wait for stop to complete
-            except Exception as e:
-                logging.warning(f"Timeout/err stopping Telegram app: {e}")
-            time.sleep(0.5)
-            logging.info("Telegram thread stopped.")
+        if tg_interface:
+            logging.info("Stopping Telegram thread...")
+            tg_interface._running = False
+            # Give it some time to shut down gracefully
+            time.sleep(2)
+            logging.info("Telegram thread stop signal sent.")
         else:
-            logging.info("Telegram app not running or loop not available.")
+            logging.info("Telegram interface not initialized.")
     except Exception as e:
         logging.error(f"Error stopping Telegram thread: {e}")

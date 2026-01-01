@@ -18,7 +18,7 @@ def main():
         telegram.initialize_telegram()
 
         while True:
-            if telegram.BOT_PAUSED:
+            if telegram.get_bot_paused():
                 logging.info("Bot is paused. Sleeping...\n")
                 time.sleep(SLEEPING_INTERVAL)
                 continue
