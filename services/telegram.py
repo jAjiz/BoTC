@@ -4,7 +4,6 @@ import logging
 import asyncio
 import json
 from queue import Queue
-from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 
 from telegram import Update
@@ -28,27 +27,12 @@ def set_bot_paused(value):
     with _state_lock:
         _bot_paused = value
 
-# Backward compatibility
-BOT_PAUSED = property(lambda: get_bot_paused())
-
 # Only log warnings and above from telegram library
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.bot").setLevel(logging.WARNING)
-
-
-def run_in_executor(func):
-    """
-    Decorator to run blocking functions in an executor from async context.
-    This prevents blocking the event loop when calling synchronous Kraken API functions.
-    """
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-    return wrapper
 
 class TelegramInterface:
     """
@@ -141,7 +125,7 @@ class TelegramInterface:
                 return
             
             # Run blocking call in executor
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             balance = await loop.run_in_executor(self._executor, get_balance)
             
             pairs_to_show = [pair_filter] if pair_filter else list(PAIRS.keys())
@@ -195,7 +179,7 @@ class TelegramInterface:
                 return
             
             # Read positions file in executor (I/O operation)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             
             def read_positions():
                 with open("data/trailing_state.json", "r", encoding="utf-8") as f:
@@ -374,8 +358,8 @@ class TelegramInterface:
             logging.error(f"Telegram thread error: {e}")
         finally:
             self._running = False
-            # Cleanup executor
-            self._executor.shutdown(wait=False)
+            # Cleanup executor with timeout
+            self._executor.shutdown(wait=True, cancel_futures=False)
             # Close event loop
             try:
                 # Cancel all remaining tasks
